@@ -21,11 +21,12 @@ from dataset.datasets import AIHubBBoxDataset
 
 
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "weights" / "samselector"
+DEFAULT_TRAINSET_CACHE_PATH = PROJECT_ROOT / "data" / "selector_trainset" / "samselector_trainset.npz"
 
 
 class MaskScoringMLP(nn.Module):
     """
-    마스크 품질 feature(7차원)를 입력으로 받아 점수(logit)를 예측하는 MLP.
+    마스크 품질 feature(8차원)를 입력으로 받아 점수(logit)를 예측하는 MLP.
 
     A lightweight MLP that maps a hand-crafted feature vector
     to a scalar suitability score (logit → sigmoid → [0, 1]).
@@ -33,13 +34,13 @@ class MaskScoringMLP(nn.Module):
     Architecture:
         Linear → BN → ReLU → Dropout → Linear → BN → ReLU → Dropout → Linear(1)
 
-    The small size is intentional: the feature vector is only 7-D,
+    The small size is intentional: the feature vector is only 8-D,
     so a deeper/wider net would overfit.
     """
 
     def __init__(
         self,
-        feat_dim: int = 7,
+        feat_dim: int = 8,
         hidden_dims: Sequence[int] = (64, 32),
         dropout: float = 0.2,
     ):
@@ -144,59 +145,77 @@ def _mask_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 
 def extract_mask_features(mask: np.ndarray, image_shape: Tuple[int, int], gt_bbox: Tuple[int, int, int, int]) -> np.ndarray:
     """
-    후보 마스크 1개에서 7차원 수치 feature를 추출한다.
+    후보 마스크 1개에서 8차원 수치 feature를 추출한다.
 
-    구성: 면적 비율, 박스 면적 비율, 채움 비율, bbox IoU,
-    GT 영역 커버리지, 중심점 포함 여부, 중심 근접도*형상 compactness.
+    목표: GT bbox만 활용하여 "적절한 segment mask"를 선택하기 위한 feature.
+    
+    Feature 구성:
+    1. inside_ratio: mask 픽셀 중 GT bbox 안에 있는 비율 (containment, 핵심!)
+    2. gt_coverage: GT bbox 중 mask가 채우는 비율 (coverage)
+    3. bbox_iou: mask bbox와 GT bbox의 IoU (위치 정합성)
+    4. size_ratio: mask 면적 / GT bbox 면적 (상대적 크기, 1에 가까울수록 좋음)
+    5. center_hit: GT 중심점이 mask에 포함되는지 (0 or 1)
+    6. centroid_distance: mask 중심과 GT 중심 간 정규화 거리 (낮을수록 좋음)
+    7. compactness: 형상 응집도 (4πA/P², 원형일수록 1에 가까움)
+    8. fill_ratio: mask 면적 / mask bbox 면적 (mask가 얼마나 꽉 찬 형태인지)
     """
     height, width = image_shape
-    total_pixels = float(height * width)
+    gx1, gy1, gx2, gy2 = gt_bbox
+    gt_area = float(max(0, gx2 - gx1) * max(0, gy2 - gy1))
 
-    area = float(mask.sum())
-    area_ratio = area / max(total_pixels, 1.0)
+    mask_area = float(mask.sum())
+    if mask_area == 0:
+        return np.zeros(8, dtype=np.float32)
 
     mb = _mask_bbox(mask)
     if mb is None:
-        return np.zeros(7, dtype=np.float32)
+        return np.zeros(8, dtype=np.float32)
 
-    mx1, my1, mx2, my2 = mb
-    box_area = float(max(0, mx2 - mx1) * max(0, my2 - my1))
-    box_area_ratio = box_area / max(total_pixels, 1.0)
-    fill_ratio = area / max(box_area, 1.0)
-
-    bbox_iou = _bbox_iou(mb, gt_bbox)
-
-    gx1, gy1, gx2, gy2 = gt_bbox
-    gt_area = float(max(0, gx2 - gx1) * max(0, gy2 - gy1))
+    # 1. inside_ratio: mask 픽셀 중 GT bbox 안에 있는 비율 (핵심 feature)
     mask_in_gt = float(mask[gy1:gy2, gx1:gx2].sum()) if gt_area > 0 else 0.0
+    inside_ratio = mask_in_gt / max(mask_area, 1.0)
+
+    # 2. gt_coverage: GT bbox 중 mask가 채우는 비율
     gt_coverage = mask_in_gt / max(gt_area, 1.0)
 
-    gcx = int((gx1 + gx2) / 2)
-    gcy = int((gy1 + gy2) / 2)
-    gcx = max(0, min(width - 1, gcx))
-    gcy = max(0, min(height - 1, gcy))
+    # 3. bbox_iou: mask bbox와 GT bbox의 IoU
+    bbox_iou = _bbox_iou(mb, gt_bbox)
+
+    # 4. size_ratio: mask 면적 / GT bbox 면적 (1에 가까울수록 적절한 크기)
+    size_ratio = mask_area / max(gt_area, 1.0)
+
+    # 5. center_hit: GT 중심점이 mask에 포함되는지
+    gcx = max(0, min(width - 1, int((gx1 + gx2) / 2)))
+    gcy = max(0, min(height - 1, int((gy1 + gy2) / 2)))
     center_hit = 1.0 if mask[gcy, gcx] else 0.0
 
+    # 6. centroid_distance: mask 중심과 GT 중심 간 정규화 거리
     ys, xs = np.where(mask)
-    cx = float(xs.mean())
-    cy = float(ys.mean())
-    diag = math.sqrt(float(width * width + height * height))
-    centroid_dist = math.sqrt((cx - gcx) ** 2 + (cy - gcy) ** 2) / max(diag, 1.0)
-    centroid_closeness = 1.0 - min(1.0, centroid_dist)
+    mcx, mcy = float(xs.mean()), float(ys.mean())
+    gt_diag = math.sqrt(float((gx2 - gx1) ** 2 + (gy2 - gy1) ** 2))
+    centroid_dist = math.sqrt((mcx - gcx) ** 2 + (mcy - gcy) ** 2)
+    centroid_distance = centroid_dist / max(gt_diag, 1.0)  # GT 대각선 기준 정규화
 
+    # 7. compactness: 형상 응집도 (4πA/P², 원형일수록 1에 가까움)
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     perimeter = float(sum(cv2.arcLength(c, True) for c in contours))
-    compactness = (4.0 * math.pi * area) / max(perimeter * perimeter, 1.0)
+    compactness = (4.0 * math.pi * mask_area) / max(perimeter * perimeter, 1.0)
+
+    # 8. fill_ratio: mask 면적 / mask bbox 면적
+    mx1, my1, mx2, my2 = mb
+    mask_bbox_area = float(max(0, mx2 - mx1) * max(0, my2 - my1))
+    fill_ratio = mask_area / max(mask_bbox_area, 1.0)
 
     return np.array(
         [
-            area_ratio,
-            box_area_ratio,
-            fill_ratio,
-            bbox_iou,
-            gt_coverage,
-            center_hit,
-            centroid_closeness * compactness,
+            inside_ratio,       # 0: containment (핵심)
+            gt_coverage,        # 1: coverage
+            bbox_iou,           # 2: 위치 정합성
+            size_ratio,         # 3: 상대적 크기
+            center_hit,         # 4: 중심점 포함
+            centroid_distance,  # 5: 중심 거리 (낮을수록 좋음)
+            compactness,        # 6: 형상 응집도
+            fill_ratio,         # 7: mask bbox 채움률
         ],
         dtype=np.float32,
     )
@@ -249,9 +268,32 @@ def build_training_data(
 
             gx1, gy1, gx2, gy2 = gt_bbox
             gt_area = float(max(0, gx2 - gx1) * max(0, gy2 - gy1))
-            mask_in_gt = float(m[gy1:gy2, gx1:gx2].sum()) if gt_area > 0 else 0.0
+            mask_area = float(m.sum())
+            
+            if mask_area == 0 or gt_area == 0:
+                continue
+                
+            mask_in_gt = float(m[gy1:gy2, gx1:gx2].sum())
+            
+            # inside_ratio: mask가 GT bbox 안에 얼마나 포함되는지 (containment)
+            inside_ratio = mask_in_gt / max(mask_area, 1.0)
+            # gt_coverage: GT bbox를 mask가 얼마나 채우는지 (coverage)
             gt_coverage = mask_in_gt / max(gt_area, 1.0)
-            target = float(np.clip(gt_coverage, 0.0, 1.0))
+            # size_ratio: mask 크기가 GT bbox 대비 적절한지 (1.0이 이상적)
+            size_ratio = mask_area / max(gt_area, 1.0)
+            
+            # Target: 세 가지 요소 결합
+            # 1. inside_ratio: bbox 밖으로 삐져나가면 안 됨
+            # 2. gt_coverage: bbox를 충분히 채워야 함
+            # 3. size_penalty: 너무 작은 mask에 강한 페널티
+            #    - size_ratio < 0.3이면 급격히 감소
+            #    - size_ratio >= 0.3이면 1.0 (패널티 없음)
+            size_penalty = min(1.0, size_ratio / 0.3)
+            
+            # 최종 target: inside * coverage * size_penalty
+            # 셋 다 높아야 좋은 mask
+            target = inside_ratio * gt_coverage * size_penalty
+            target = float(np.clip(target, 0.0, 1.0))
 
             features.append(feat)
             targets.append(target)
@@ -260,6 +302,60 @@ def build_training_data(
         raise RuntimeError("No training samples were built. Check annotation path and SAM output.")
 
     return np.vstack(features).astype(np.float32), np.array(targets, dtype=np.float32)
+
+
+def save_selector_trainset_cache(features: np.ndarray, targets: np.ndarray, cache_path: str) -> None:
+    """생성된 selector 학습셋(feature/target)을 디스크에 저장한다."""
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, features=features.astype(np.float32), targets=targets.astype(np.float32))
+
+
+def load_selector_trainset_cache(cache_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """디스크에 저장된 selector 학습셋(feature/target)을 로드한다."""
+    path = Path(cache_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Selector trainset cache not found: {path}")
+
+    data = np.load(path)
+    if "features" not in data or "targets" not in data:
+        raise RuntimeError(f"Invalid selector trainset cache format: {path}")
+
+    features = data["features"].astype(np.float32)
+    targets = data["targets"].astype(np.float32)
+    return features, targets
+
+
+def get_or_build_training_data(
+    annotation_root: str,
+    sam_model_path: str,
+    cache_path: str,
+    max_images: Optional[int] = None,
+    max_masks_per_image: Optional[int] = None,
+    seed: int = 42,
+    rebuild_cache: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    selector 학습셋 캐시가 있으면 로드하고, 없으면 생성 후 저장한다.
+
+    rebuild_cache=True이면 캐시가 있어도 다시 생성한다.
+    """
+    cache_file = Path(cache_path)
+    if cache_file.exists() and not rebuild_cache:
+        print(f"[Selector trainset] Load cache: {cache_file}")
+        return load_selector_trainset_cache(str(cache_file))
+
+    print(f"[Selector trainset] Build cache: {cache_file}")
+    features, targets = build_training_data(
+        annotation_root=annotation_root,
+        sam_model_path=sam_model_path,
+        max_images=max_images,
+        max_masks_per_image=max_masks_per_image,
+        seed=seed,
+    )
+    save_selector_trainset_cache(features, targets, str(cache_file))
+    print(f"[Selector trainset] Saved cache: {cache_file}")
+    return features, targets
 
 
 def train_mask_selector(
@@ -313,7 +409,38 @@ def train_mask_selector(
     run_device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     model = MaskScoringMLP(feat_dim=features.shape[1], hidden_dims=hidden_dims, dropout=dropout).to(run_device)
-    criterion = nn.BCEWithLogitsLoss()
+
+    def mask_quality_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        적절한 segment mask 선택을 위한 custom loss.
+        
+        Target: containment(inside_ratio)와 coverage의 가중 조화평균
+        - 높은 target = GT bbox 안에 잘 포함되면서 적절히 커버하는 좋은 mask
+        - 낮은 target = bbox 밖으로 삐져나가거나 커버리지가 부족한 나쁜 mask
+        
+        Loss 설계:
+        1. 기본 MSE loss로 target 점수 예측
+        2. 나쁜 mask(낮은 target)에 더 큰 가중치 → 나쁜 mask를 확실히 걸러냄
+        3. 좋은 mask 간의 미세한 차이도 학습하도록 margin 추가
+        """
+        pred = torch.sigmoid(logits)
+        
+        # 기본 MSE loss
+        mse_loss = (pred - targets) ** 2
+        
+        # 나쁜 mask(낮은 target)에 더 큰 패널티
+        # target이 0.5 이하면 가중치 증가 (최대 2.0)
+        bad_mask_weight = 1.0 + torch.clamp(0.5 - targets, min=0.0) * 2.0
+        
+        # 좋은 mask(높은 target)의 순위 학습을 위한 smooth L1 추가
+        smooth_l1 = torch.nn.functional.smooth_l1_loss(pred, targets, reduction='none', beta=0.1)
+        
+        # 최종 loss: weighted MSE + smooth L1
+        weighted_loss = mse_loss * bad_mask_weight + 0.5 * smooth_l1
+        
+        return weighted_loss.mean()
+
+    criterion = mask_quality_loss
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_state = None
@@ -453,7 +580,12 @@ class AutoMaskSelector:
     def __init__(self, checkpoint_path: str, device: Optional[str] = None):
         """모델과 feature 정규화 통계(mean/std)를 복원한다."""
         run_device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
-        ckpt = torch.load(checkpoint_path, map_location=run_device)
+        try:
+            # Our checkpoint stores numpy metadata (feat_mean/std, history), so use full load.
+            ckpt = torch.load(checkpoint_path, map_location=run_device, weights_only=False)
+        except TypeError:
+            # Backward compatibility for older torch versions without weights_only arg.
+            ckpt = torch.load(checkpoint_path, map_location=run_device)
 
         hidden_dims = ckpt.get("hidden_dims", [64, 32])
         dropout = ckpt.get("dropout", 0.2)
@@ -535,6 +667,17 @@ def main() -> None:
         default=str(DEFAULT_CHECKPOINT_DIR),
         help="Directory to save last_checkpoint.pth and best_checkpoint.pth",
     )
+    parser.add_argument(
+        "--selector-trainset-cache",
+        type=str,
+        default=str(DEFAULT_TRAINSET_CACHE_PATH),
+        help="Cached selector trainset path (.npz)",
+    )
+    parser.add_argument(
+        "--rebuild-selector-trainset",
+        action="store_true",
+        help="Force rebuilding selector trainset cache even if it exists",
+    )
     parser.add_argument("--max-images", type=int, default=None, help="Optional cap on number of images for quick experiments.")
     parser.add_argument("--max-masks-per-image", type=int, default=10, help="Optional cap on masks sampled per image.")
     parser.add_argument("--epochs", type=int, default=20)
@@ -547,12 +690,14 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="cpu or cuda")
     args = parser.parse_args()
 
-    feats, targets = build_training_data(
+    feats, targets = get_or_build_training_data(
         annotation_root=args.anno_root,
         sam_model_path=args.sam_weights,
+        cache_path=args.selector_trainset_cache,
         max_images=args.max_images,
         max_masks_per_image=args.max_masks_per_image,
         seed=args.seed,
+        rebuild_cache=args.rebuild_selector_trainset,
     )
 
     model, metadata = train_mask_selector(

@@ -94,9 +94,11 @@ class SAM2MaskGenerator:
                 raise RuntimeError("Auto selector is not initialized.")
 
             results = self.model(image_path, verbose=False)
+            # CNN 기반 selector는 image도 필요
             best_idx, _ = select_best_mask_from_ultralytics_result(
                 selector=self.selector,
                 result=results[0],
+                image=img,
                 bbox_xyxy=tuple(bbox),
             )
             move_result_mask_to_front(results[0], best_idx)

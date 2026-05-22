@@ -1,412 +1,276 @@
-package com.example.cropdisease
-
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.RectF
+import org.json.JSONArray
+import org.pytorch.executorch.EValue
+import org.pytorch.executorch.Module
+import org.pytorch.executorch.Tensor
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sqrt
 
-data class TensorData(
-	val data: FloatArray,
-	val shape: LongArray,
-)
 
 data class PredictionResult(
-	val predictedClass: String,
+	val className: String,
 	val confidence: Float,
-	val logits: FloatArray,
-	val probabilities: FloatArray,
-	val segmentedBitmap: Bitmap,
 )
 
-data class DiseasePredictorConfig(
-	val samPteAssetPath: String = "models/sam2.1_t_box.pte",
-	val featurePteAssetPath: String = "models/prototype_mobv3.pte",
-	val textCsvAssetDir: String = "text_embeddings_csv",
-	val classNames: List<String> = listOf(
-		"cucumber_downy",
-		"cucumber_healthy",
-		"cucumber_powdery",
-		"grape_downy",
-		"grape_healthy",
-		"paprica_healthy",
-		"paprica_powdery",
-		"pepper_healthy",
-		"pepper_powdery",
-		"strawberry_healthy",
-		"strawberry_powdery",
-		"tomato_graymold",
-		"tomato_healthy",
-		"tomato_powdery",
-	),
-	val samInputSize: Int = 1024,
-	val featureInputSize: Int = 224,
-	val samMaskThreshold: Float = 0.5f,
-	val grayBackgroundColor: Int = Color.rgb(128, 128, 128),
-	val hardcodedBoxRatio: RectF = RectF(0.15f, 0.15f, 0.85f, 0.85f),
-)
 
-interface PteBackend {
-	fun run(modelAssetPath: String, inputs: List<TensorData>): List<TensorData>
-}
-
-class DiseasePredictor(
-	private val context: Context,
-	private val backend: PteBackend,
-	private val config: DiseasePredictorConfig = DiseasePredictorConfig(),
-) {
-
-	private val textEmbeddingsByCrop: Map<String, Array<FloatArray>> =
-		loadCropEmbeddingsFromCsv(context, config.textCsvAssetDir)
-
-	private val classPrototypes: Array<FloatArray> by lazy {
-		buildClassPrototypes(config.classNames, textEmbeddingsByCrop)
+class DiseasePredictor(private val context: Context) {
+	companion object {
+		private const val DEFAULT_IMAGE_SIZE = 224
+		private const val DEFAULT_SAM_INPUT_SIZE = 1024
+		private val NORM_MEAN_RGB = floatArrayOf(0.485f, 0.456f, 0.406f)
+		private val NORM_STD_RGB = floatArrayOf(0.229f, 0.224f, 0.225f)
 	}
 
-	fun predict(inputBitmap: Bitmap, cropNameRaw: String): PredictionResult {
-		val cropName = normalizeCropName(cropNameRaw)
-		val cropQueries = textEmbeddingsByCrop[cropName]
-			?: error("No CSV embedding found for crop: $cropName")
+	private var secondStageModule: Module? = null
+	private var samModule: Module? = null
+	private var classNames: List<String> = emptyList()
+	private var embeddingShape: IntArray = intArrayOf(5, 512)
+	private val embeddingMap: MutableMap<String, FloatArray> = mutableMapOf()
 
-		val samMask = runSamBoxSegmentation(inputBitmap)
-		val segmentedBitmap = applyGrayBackgroundMask(inputBitmap, samMask, config.grayBackgroundColor)
-		val imageFeature = runImageFeatureExtractor(segmentedBitmap)
-
-		val fusedFeature = CrossAttentionOps.singleQueryCrossAttention(
-			imageFeature = imageFeature,
-			textQueries = cropQueries,
-		)
-
-		val logits = classifyWithPrototypes(fusedFeature, classPrototypes)
-		val probs = softmax(logits)
-		val topIdx = argmax(probs)
-
-		return PredictionResult(
-			predictedClass = config.classNames[topIdx],
-			confidence = probs[topIdx],
-			logits = logits,
-			probabilities = probs,
-			segmentedBitmap = segmentedBitmap,
-		)
-	}
-
-	private fun runSamBoxSegmentation(bitmap: Bitmap): BooleanArray {
-		val resized = Bitmap.createScaledBitmap(bitmap, config.samInputSize, config.samInputSize, true)
-		val imageTensor = bitmapToChwFloatTensor(resized, normalize = false)
-
-		val ratio = config.hardcodedBoxRatio
-		val x1 = ratio.left * config.samInputSize
-		val y1 = ratio.top * config.samInputSize
-		val x2 = ratio.right * config.samInputSize
-		val y2 = ratio.bottom * config.samInputSize
-		val boxTensor = floatArrayOf(x1, y1, x2, y2)
-
-		val outputs = backend.run(
-			modelAssetPath = config.samPteAssetPath,
-			inputs = listOf(
-				TensorData(
-					data = imageTensor,
-					shape = longArrayOf(1, 3, config.samInputSize.toLong(), config.samInputSize.toLong()),
-				),
-				TensorData(
-					data = boxTensor,
-					shape = longArrayOf(1, 4),
-				),
-			),
-		)
-
-		val maskTensor = outputs.firstOrNull() ?: error("SAM output is empty")
-		return decodeMaskToOriginalSize(
-			maskTensor = maskTensor,
-			srcWidth = config.samInputSize,
-			srcHeight = config.samInputSize,
-			dstWidth = bitmap.width,
-			dstHeight = bitmap.height,
-			threshold = config.samMaskThreshold,
-		)
-	}
-
-	private fun runImageFeatureExtractor(segmentedBitmap: Bitmap): FloatArray {
-		val resized = Bitmap.createScaledBitmap(
-			segmentedBitmap,
-			config.featureInputSize,
-			config.featureInputSize,
-			true,
-		)
-		val imageTensor = bitmapToChwFloatTensor(resized, normalize = true)
-
-		val outputs = backend.run(
-			modelAssetPath = config.featurePteAssetPath,
-			inputs = listOf(
-				TensorData(
-					data = imageTensor,
-					shape = longArrayOf(1, 3, config.featureInputSize.toLong(), config.featureInputSize.toLong()),
-				),
-			),
-		)
-
-		val featureTensor = outputs.firstOrNull() ?: error("Feature extractor output is empty")
-		return flattenFeature(featureTensor)
-	}
-
-	private fun classifyWithPrototypes(feature: FloatArray, prototypes: Array<FloatArray>): FloatArray {
-		val f = l2Normalize(feature)
-		return FloatArray(prototypes.size) { idx ->
-			dot(f, prototypes[idx])
-		}
-	}
-}
-
-object CrossAttentionOps {
-	fun singleQueryCrossAttention(
-		imageFeature: FloatArray,
-		textQueries: Array<FloatArray>,
-	): FloatArray {
-		val q = l2Normalize(imageFeature)
-		val keys = textQueries.map { l2Normalize(it) }
-		val values = textQueries.map { it }
-
-		val scale = sqrt(max(1, q.size).toFloat())
-		val scores = FloatArray(keys.size) { i -> dot(q, keys[i]) / scale }
-		val attn = softmax(scores)
-
-		val context = FloatArray(imageFeature.size)
-		for (i in values.indices) {
-			val w = attn[i]
-			val v = values[i]
-			for (d in context.indices) {
-				context[d] += w * v[d]
-			}
-		}
-
-		val fused = FloatArray(imageFeature.size)
-		for (d in fused.indices) {
-			fused[d] = imageFeature[d] + context[d]
-		}
-		return l2Normalize(fused)
-	}
-}
-
-fun loadCropEmbeddingsFromCsv(context: Context, assetDir: String): Map<String, Array<FloatArray>> {
-	val fileNames = context.assets.list(assetDir)?.toList().orEmpty()
-	val csvFiles = fileNames.filter { it.endsWith(".csv", ignoreCase = true) }
-
-	val map = linkedMapOf<String, Array<FloatArray>>()
-	for (fileName in csvFiles) {
-		val crop = fileName.substringBeforeLast(".").lowercase()
-		val rows = mutableListOf<FloatArray>()
-
-		context.assets.open("$assetDir/$fileName").bufferedReader().use { br ->
-			val lines = br.readLines()
-			if (lines.size <= 1) {
-				return@use
-			}
-			for (line in lines.drop(1)) {
-				if (line.isBlank()) continue
-				val cols = line.split(',')
-				if (cols.size <= 2) continue
-				val vec = FloatArray(cols.size - 1)
-				for (i in 1 until cols.size) {
-					vec[i - 1] = cols[i].toFloat()
-				}
-				rows += vec
-			}
-		}
-
-		if (rows.isNotEmpty()) {
-			map[crop] = rows.toTypedArray()
-		}
-	}
-
-	if (map.isEmpty()) {
-		error("No embedding CSV found in assets/$assetDir")
-	}
-	return map
-}
-
-fun buildClassPrototypes(
-	classNames: List<String>,
-	textEmbeddingsByCrop: Map<String, Array<FloatArray>>,
-): Array<FloatArray> {
-	val dim = textEmbeddingsByCrop.values.first().first().size
-	return Array(classNames.size) { classIdx ->
-		val className = classNames[classIdx]
-		val crop = normalizeCropName(className.substringBefore('_'))
-		val queries = textEmbeddingsByCrop[crop]
-			?: error("No crop embedding found for class prototype: $className")
-
-		val mean = FloatArray(dim)
-		for (q in queries) {
-			for (d in 0 until dim) {
-				mean[d] += q[d]
-			}
-		}
-		for (d in 0 until dim) {
-			mean[d] /= queries.size.toFloat()
-		}
-		l2Normalize(mean)
-	}
-}
-
-fun applyGrayBackgroundMask(bitmap: Bitmap, mask: BooleanArray, grayColor: Int): Bitmap {
-	val w = bitmap.width
-	val h = bitmap.height
-	require(mask.size == w * h) { "Mask size mismatch. expected=${w * h}, got=${mask.size}" }
-
-	val out = bitmap.copy(Bitmap.Config.ARGB_8888, true)
-	val pixels = IntArray(w * h)
-	out.getPixels(pixels, 0, w, 0, 0, w, h)
-
-	for (i in pixels.indices) {
-		if (!mask[i]) {
-			pixels[i] = grayColor
-		}
-	}
-	out.setPixels(pixels, 0, w, 0, 0, w, h)
-	return out
-}
-
-fun decodeMaskToOriginalSize(
-	maskTensor: TensorData,
-	srcWidth: Int,
-	srcHeight: Int,
-	dstWidth: Int,
-	dstHeight: Int,
-	threshold: Float,
-): BooleanArray {
-	val srcMask = extractMask2d(maskTensor, srcWidth, srcHeight)
-	val dstMask = BooleanArray(dstWidth * dstHeight)
-
-	for (y in 0 until dstHeight) {
-		val sy = min(srcHeight - 1, (y.toFloat() / dstHeight * srcHeight).toInt())
-		for (x in 0 until dstWidth) {
-			val sx = min(srcWidth - 1, (x.toFloat() / dstWidth * srcWidth).toInt())
-			val v = srcMask[sy * srcWidth + sx]
-			dstMask[y * dstWidth + x] = v >= threshold
-		}
-	}
-	return dstMask
-}
-
-fun extractMask2d(maskTensor: TensorData, width: Int, height: Int): FloatArray {
-	val total = width * height
-	val shape = maskTensor.shape
-	val data = maskTensor.data
-
-	if (data.size == total) {
-		return data
-	}
-
-	if (shape.size == 4L.toInt() && shape[0] == 1L && shape[1] == 1L &&
-		shape[2].toInt() == height && shape[3].toInt() == width
+	fun initModels(
+		secondStageAsset: String = "second_stage.pte",
+		samAsset: String? = "sam2_box.pte",
+		classNamesAsset: String = "class_names.json",
+		cropsAsset: String = "crops.json",
+		embeddingShapeAsset: String = "embedding_shape.json",
+		embeddingDirAsset: String = "embeddings",
 	) {
-		return data.copyOfRange(0, total)
-	}
+		secondStageModule = Module.load(assetFilePath(context, secondStageAsset))
+		classNames = loadJsonArray(classNamesAsset)
+		embeddingShape = loadEmbeddingShape(embeddingShapeAsset)
+		loadEmbeddings(cropsAsset, embeddingDirAsset)
 
-	if (data.size >= total) {
-		return data.copyOfRange(0, total)
-	}
-	error("Unsupported SAM mask shape=${shape.contentToString()} dataSize=${data.size}")
-}
-
-fun flattenFeature(tensor: TensorData): FloatArray {
-	val data = tensor.data
-	val shape = tensor.shape
-
-	if (shape.isEmpty()) return data
-	if (shape.size == 2 && shape[0] == 1L) return data.copyOfRange(0, shape[1].toInt())
-	if (shape.size == 4 && shape[0] == 1L) {
-		val c = shape[1].toInt()
-		val h = shape[2].toInt()
-		val w = shape[3].toInt()
-		val out = FloatArray(c)
-		val spatial = max(1, h * w)
-		for (ci in 0 until c) {
-			var sum = 0f
-			for (i in 0 until spatial) {
-				sum += data[ci * spatial + i]
+		if (samAsset != null) {
+			samModule = try {
+				Module.load(assetFilePath(context, samAsset))
+			} catch (e: Exception) {
+				null
 			}
-			out[ci] = sum / spatial.toFloat()
 		}
+	}
+
+	fun predictWithSam(bitmap: Bitmap, bboxXyxy: FloatArray, cropName: String): PredictionResult {
+		val sam = samModule ?: throw IllegalStateException("SAM module not loaded")
+		val masked = applySamMask(sam, bitmap, bboxXyxy, DEFAULT_SAM_INPUT_SIZE)
+		return predictMasked(masked, cropName)
+	}
+
+	fun predictMasked(bitmap: Bitmap, cropName: String): PredictionResult {
+		val module = secondStageModule ?: throw IllegalStateException("Second-stage module not loaded")
+		val cropKey = cropName.trim().lowercase()
+		val embedding = embeddingMap[cropKey]
+			?: throw IllegalArgumentException("Missing embedding for crop: $cropKey")
+
+		val imageTensor = bitmapToTensor(bitmap, DEFAULT_IMAGE_SIZE)
+		val textTensor = Tensor.fromBlob(embedding, longArrayOf(1, embeddingShape[0].toLong(), embeddingShape[1].toLong()))
+
+		val outputs = module.forward(
+			EValue.from(imageTensor),
+			EValue.from(textTensor),
+		)
+		val scores = outputs[0].toTensor().getDataAsFloatArray()
+		val probs = softmax(scores)
+		val maxIdx = probs.indices.maxByOrNull { probs[it] } ?: 0
+		val className = classNames.getOrNull(maxIdx) ?: "unknown"
+		return PredictionResult(className, probs[maxIdx])
+	}
+
+	private fun applySamMask(
+		sam: Module,
+		bitmap: Bitmap,
+		bboxXyxy: FloatArray,
+		samInputSize: Int,
+	): Bitmap {
+		val resized = Bitmap.createScaledBitmap(bitmap, samInputSize, samInputSize, true)
+		val imageTensor = bitmapToTensor(resized, samInputSize)
+		val scaledBbox = scaleBbox(bboxXyxy, bitmap.width, bitmap.height, samInputSize, samInputSize)
+		val bboxTensor = Tensor.fromBlob(scaledBbox, longArrayOf(1, 4))
+
+		val outputs = sam.forward(EValue.from(imageTensor), EValue.from(bboxTensor))
+		val maskTensor = outputs[0].toTensor()
+		val mask = maskTensor.getDataAsFloatArray()
+
+		return maskBitmap(resized, mask, samInputSize, samInputSize)
+	}
+
+	private fun bitmapToTensor(bitmap: Bitmap, imageSize: Int): Tensor {
+		val resized = if (bitmap.width == imageSize && bitmap.height == imageSize) {
+			bitmap
+		} else {
+			Bitmap.createScaledBitmap(bitmap, imageSize, imageSize, true)
+		}
+
+		val floatArray = FloatArray(1 * 3 * imageSize * imageSize)
+		val pixels = IntArray(imageSize * imageSize)
+		resized.getPixels(pixels, 0, imageSize, 0, 0, imageSize, imageSize)
+		val channelSize = imageSize * imageSize
+
+		for (i in pixels.indices) {
+			val c = pixels[i]
+			val r = (Color.red(c) / 255.0f - NORM_MEAN_RGB[0]) / NORM_STD_RGB[0]
+			val g = (Color.green(c) / 255.0f - NORM_MEAN_RGB[1]) / NORM_STD_RGB[1]
+			val b = (Color.blue(c) / 255.0f - NORM_MEAN_RGB[2]) / NORM_STD_RGB[2]
+
+			floatArray[i] = r
+			floatArray[i + channelSize] = g
+			floatArray[i + channelSize * 2] = b
+		}
+
+		return Tensor.fromBlob(floatArray, longArrayOf(1, 3, imageSize.toLong(), imageSize.toLong()))
+	}
+
+	private fun maskBitmap(bitmap: Bitmap, mask: FloatArray, width: Int, height: Int): Bitmap {
+		val pixels = IntArray(width * height)
+		bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+		val outPixels = IntArray(width * height)
+		val bg = Color.rgb(128, 128, 128)
+
+		for (i in pixels.indices) {
+			val keep = mask.getOrNull(i)?.let { it >= 0.5f } ?: false
+			outPixels[i] = if (keep) pixels[i] else bg
+		}
+
+		val out = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+		out.setPixels(outPixels, 0, width, 0, 0, width, height)
 		return out
 	}
-	return data
-}
 
-fun bitmapToChwFloatTensor(bitmap: Bitmap, normalize: Boolean): FloatArray {
-	val w = bitmap.width
-	val h = bitmap.height
-	val pixels = IntArray(w * h)
-	bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+	private fun scaleBbox(
+		bbox: FloatArray,
+		srcW: Int,
+		srcH: Int,
+		dstW: Int,
+		dstH: Int,
+	): FloatArray {
+		val scaleX = dstW.toFloat() / max(srcW, 1)
+		val scaleY = dstH.toFloat() / max(srcH, 1)
+		val x1 = bbox[0] * scaleX
+		val y1 = bbox[1] * scaleY
+		val x2 = bbox[2] * scaleX
+		val y2 = bbox[3] * scaleY
+		return floatArrayOf(
+			min(max(x1, 0f), dstW.toFloat() - 1f),
+			min(max(y1, 0f), dstH.toFloat() - 1f),
+			min(max(x2, 0f), dstW.toFloat()),
+			min(max(y2, 0f), dstH.toFloat()),
+		)
+	}
 
-	val out = FloatArray(3 * w * h)
-	val area = w * h
+	private fun softmax(logits: FloatArray): FloatArray {
+		val maxLogit = logits.maxOrNull() ?: 0f
+		val expValues = logits.map { exp((it - maxLogit).toDouble()).toFloat() }
+		val sum = expValues.sum().coerceAtLeast(1e-8f)
+		return expValues.map { it / sum }.toFloatArray()
+	}
 
-	val mean = floatArrayOf(0.485f, 0.456f, 0.406f)
-	val std = floatArrayOf(0.229f, 0.224f, 0.225f)
+	private fun loadEmbeddings(cropsAsset: String, embeddingDirAsset: String) {
+		val crops = loadJsonArray(cropsAsset)
+		for (crop in crops) {
+			val path = "$embeddingDirAsset/$crop.npy"
+			val (data, shape) = loadNpyFloat(path)
+			if (shape.size != 2) {
+				throw IllegalStateException("Invalid embedding shape in $path")
+			}
+			embeddingMap[crop.lowercase()] = data
+		}
+	}
 
-	for (i in pixels.indices) {
-		val p = pixels[i]
-		var r = Color.red(p) / 255.0f
-		var g = Color.green(p) / 255.0f
-		var b = Color.blue(p) / 255.0f
+	private fun loadJsonArray(assetName: String): List<String> {
+		val text = readAssetText(assetName)
+		val array = JSONArray(text)
+		val list = ArrayList<String>(array.length())
+		for (i in 0 until array.length()) {
+			list.add(array.getString(i))
+		}
+		return list
+	}
 
-		if (normalize) {
-			r = (r - mean[0]) / std[0]
-			g = (g - mean[1]) / std[1]
-			b = (b - mean[2]) / std[2]
+	private fun loadEmbeddingShape(assetName: String): IntArray {
+		val text = readAssetText(assetName)
+		val obj = org.json.JSONObject(text)
+		val numQueries = obj.getInt("num_queries")
+		val embedDim = obj.getInt("embed_dim")
+		return intArrayOf(numQueries, embedDim)
+	}
+
+	private fun loadNpyFloat(assetName: String): Pair<FloatArray, IntArray> {
+		val bytes = readAssetBytes(assetName)
+		val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+		val magic = ByteArray(6)
+		buffer.get(magic)
+		val versionMajor = buffer.get().toInt()
+		buffer.get()
+		val headerLen = if (versionMajor <= 1) {
+			buffer.short.toInt() and 0xFFFF
+		} else {
+			buffer.int
+		}
+		val headerBytes = ByteArray(headerLen)
+		buffer.get(headerBytes)
+		val header = String(headerBytes)
+
+		if (!header.contains("'<f4'")) {
+			throw IllegalStateException("Only float32 little-endian npy is supported")
 		}
 
-		out[i] = r
-		out[area + i] = g
-		out[2 * area + i] = b
+		val shape = parseShape(header)
+		val count = shape.fold(1) { acc, v -> acc * v }
+		val out = FloatArray(count)
+		for (i in 0 until count) {
+			out[i] = buffer.float
+		}
+		return Pair(out, shape)
 	}
-	return out
-}
 
-fun normalizeCropName(raw: String): String {
-	val n = raw.trim().lowercase()
-	return if (n == "paprica") "paprika" else n
-}
-
-fun l2Normalize(v: FloatArray): FloatArray {
-	var normSq = 0f
-	for (x in v) normSq += x * x
-	val norm = sqrt(max(normSq, 1e-12f))
-	return FloatArray(v.size) { i -> v[i] / norm }
-}
-
-fun dot(a: FloatArray, b: FloatArray): Float {
-	require(a.size == b.size) { "Dot size mismatch: ${a.size} vs ${b.size}" }
-	var s = 0f
-	for (i in a.indices) s += a[i] * b[i]
-	return s
-}
-
-fun softmax(x: FloatArray): FloatArray {
-	if (x.isEmpty()) return x
-	var maxVal = x[0]
-	for (v in x) if (v > maxVal) maxVal = v
-
-	val exps = FloatArray(x.size)
-	var sum = 0f
-	for (i in x.indices) {
-		val e = exp((x[i] - maxVal).toDouble()).toFloat()
-		exps[i] = e
-		sum += e
+	private fun parseShape(header: String): IntArray {
+		val shapeRegex = "\\(.*?\\)".toRegex()
+		val match = shapeRegex.find(header) ?: throw IllegalStateException("Shape not found in npy header")
+		val inside = match.groupValues[1]
+		val parts = inside.split(",").mapNotNull {
+			val trimmed = it.trim()
+			if (trimmed.isEmpty()) null else trimmed.toIntOrNull()
+		}
+		return parts.toIntArray()
 	}
-	if (sum <= 0f) return FloatArray(x.size) { 1f / x.size }
-	return FloatArray(x.size) { i -> exps[i] / sum }
-}
 
-fun argmax(x: FloatArray): Int {
-	require(x.isNotEmpty()) { "Cannot argmax empty array" }
-	var best = 0
-	for (i in 1 until x.size) {
-		if (x[i] > x[best]) best = i
+	private fun readAssetText(assetName: String): String {
+		return readAssetBytes(assetName).toString(Charsets.UTF_8)
 	}
-	return best
+
+	private fun readAssetBytes(assetName: String): ByteArray {
+		context.assets.open(assetName).use { input ->
+			return readAllBytes(input)
+		}
+	}
+
+	private fun readAllBytes(input: InputStream): ByteArray {
+		val buffer = ByteArrayOutputStream()
+		val data = ByteArray(4096)
+		while (true) {
+			val count = input.read(data)
+			if (count <= 0) break
+			buffer.write(data, 0, count)
+		}
+		return buffer.toByteArray()
+	}
+
+	private fun assetFilePath(context: Context, assetName: String): String {
+		val file = context.getFileStreamPath(assetName)
+		if (file.exists() && file.length() > 0) {
+			return file.absolutePath
+		}
+		context.assets.open(assetName).use { input ->
+			file.outputStream().use { output ->
+				input.copyTo(output)
+			}
+		}
+		return file.absolutePath
+	}
 }

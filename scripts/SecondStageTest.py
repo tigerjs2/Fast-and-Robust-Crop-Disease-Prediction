@@ -38,7 +38,7 @@ from scripts.SecondStageTrain import (
 
 
 DEFAULT_WEIGHT_PATH = PROJECT_ROOT / "weights" / "second_stage" / "best_classifier.pth"
-DEFAULT_TEST_DIR = PROJECT_ROOT / "data" / "AIHub" / "test"
+DEFAULT_TEST_DIR = PROJECT_ROOT / "data" / "AIHub_box" / "test"
 DEFAULT_TEXT_EMBEDDING_DIR = PROJECT_ROOT / "data" / "TextEmbeddings"
 DEFAULT_MISMATCH_SEED = 314159
 
@@ -482,6 +482,9 @@ def main() -> None:
 	class_names = checkpoint.get("class_names")
 	if not class_names:
 		raise KeyError("Checkpoint does not contain class_names")
+	print("Classifier class index mapping:")
+	for idx, name in enumerate(class_names):
+		print(f"  {idx}: {name}")
 
 	model = build_model_from_checkpoint(checkpoint, num_classes=len(class_names), device=device)
 	test_loader = build_test_loader(

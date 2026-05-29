@@ -36,7 +36,13 @@ def main():
     print("[Step 3] 가중치 INT8 양자화 연산 그래프 생성 중...")
     
     # ExecuTorch CPU(XNNPACK) 가속과 100% 호환되는 대칭형 양자화 설정 적용
-    quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config())
+    #quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config())
+    quantizer = XNNPACKQuantizer()
+    quant_config = get_symmetric_quantization_config()
+    
+    # set_registry 대신 set_module_type을 사용하여 Conv2d와 Linear만 선택적 양자화
+    quantizer.set_module_type(torch.nn.Conv2d, quant_config)
+    quantizer.set_module_type(torch.nn.Linear, quant_config)
     
     # 그래프에 양자화 관측 노드 삽입
     prepared_program = prepare_pt2e(exported_program, quantizer)

@@ -22,11 +22,13 @@ except Exception as exc:
 
 from scripts.SecondStageTest import build_model_from_checkpoint, load_checkpoint
 
-DEFAULT_TEST_DIR = PROJECT_ROOT / "data" / "AIHub_box" / "test"
+DEFAULT_TEST_DIR = PROJECT_ROOT / "data" / "AIHub" / "test"
 DEFAULT_ASSETS_DIR = PROJECT_ROOT / "mobile_assets"
 DEFAULT_SECOND_STAGE_PTE = DEFAULT_ASSETS_DIR / "second_stage.pte"
-DEFAULT_SAM_ENCODER_PTE = DEFAULT_ASSETS_DIR / "sam2.1_t_encoder.pte"
-DEFAULT_SAM_DECODER_PTE = DEFAULT_ASSETS_DIR / "sam2.1_t_box_decoder_512.pte"
+DEFAULT_SAM_ENCODER_PTE = DEFAULT_ASSETS_DIR / "sam2.1_t_encoder256.pte"
+# DEFAULT_SAM_ENCODER_PTE = DEFAULT_ASSETS_DIR / "sam2.1_t_encoder.pte"  # (orig 512)
+DEFAULT_SAM_DECODER_PTE = DEFAULT_ASSETS_DIR / "sam2.1_t_box_decoder_256.pte"
+# DEFAULT_SAM_DECODER_PTE = DEFAULT_ASSETS_DIR / "sam2.1_t_box_decoder_512.pte"  # (orig 512)
 DEFAULT_CLASS_NAMES = DEFAULT_ASSETS_DIR / "class_names.json"
 DEFAULT_CROPS = DEFAULT_ASSETS_DIR / "crops.json"
 DEFAULT_EMBEDDING_SHAPE = DEFAULT_ASSETS_DIR / "embedding_shape.json"
@@ -115,19 +117,19 @@ def _discover_dataset(test_dir: Path, class_names: Sequence[str]) -> List[Tuple[
 
 
 def _resize_and_normalize(img_rgb: np.ndarray, image_size: int) -> np.ndarray:
-	resized = cv2.resize(img_rgb, (image_size, image_size), interpolation=cv2.INTER_AREA)
+	resized = cv2.resize(img_rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
 	arr = resized.astype(np.float32) / 255.0
 	arr = (arr - NORM_MEAN_RGB) / NORM_STD_RGB
 	return arr
 
 
 def _to_chw_tensor(img_rgb: np.ndarray) -> torch.Tensor:
-	chw = np.transpose(img_rgb, (2, 0, 1))
-	return torch.from_numpy(chw).unsqueeze(0)
+    tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).unsqueeze(0).contiguous()	
+    return tensor
 
 
 def _to_sam_tensor(img_rgb: np.ndarray, sam_input_size: int) -> torch.Tensor:
-	resized = cv2.resize(img_rgb, (sam_input_size, sam_input_size), interpolation=cv2.INTER_AREA)
+	resized = cv2.resize(img_rgb, (sam_input_size, sam_input_size), interpolation=cv2.INTER_LINEAR)
 	arr = resized.astype(np.float32)
 	arr = (arr - SAM_MEAN_RGB) / SAM_STD_RGB
 	chw = np.transpose(arr, (2, 0, 1))
@@ -185,6 +187,16 @@ def _build_masked_output_path(image_path: Path, test_dir: Path, output_dir: Path
 		return output_dir / rel
 	except ValueError:
 		return output_dir / image_path.name
+
+
+def _build_mask_variant_path(
+	image_path: Path,
+	test_dir: Path,
+	output_dir: Path,
+	suffix: str,
+) -> Path:
+	base = _build_masked_output_path(image_path, test_dir, output_dir)
+	return base.with_name(f"{base.stem}_{suffix}.png")
 
 
 def _draw_bbox_on_image(img_rgb: np.ndarray, bbox_xyxy: np.ndarray) -> np.ndarray:
@@ -258,8 +270,10 @@ def _select_sam_features(outputs: Sequence[torch.Tensor], sam_input_size: int) -
 	image_embed: Optional[torch.Tensor] = None
 	feat_s0: Optional[torch.Tensor] = None
 	feat_s1: Optional[torch.Tensor] = None
-	expected_s0 = 256 if sam_input_size >= 1024 else 128
-	expected_s1 = 128 if sam_input_size >= 1024 else 64
+	# expected_s0 = 256 if sam_input_size >= 1024 else 128
+	# expected_s1 = 128 if sam_input_size >= 1024 else 64
+	expected_s0 = 64
+	expected_s1 = 32
 
 	for tensor in outputs:
 		if not isinstance(tensor, torch.Tensor):
@@ -303,12 +317,172 @@ def _apply_mask_to_image(img_rgb: np.ndarray, mask_tensor: torch.Tensor) -> np.n
 	return output
 
 
+def _overlay_mask_on_image(
+	img_rgb: np.ndarray,
+	mask_tensor: torch.Tensor,
+	color: Tuple[int, int, int],
+	alpha: float = 0.45,
+) -> np.ndarray:
+	mask = mask_tensor
+	while mask.dim() > 2:
+		mask = mask[0]
+	mask_np = mask.detach().cpu().numpy()
+	mask_bin = mask_np > 0.0
+
+	h, w = img_rgb.shape[:2]
+	mask_u8 = (mask_bin.astype(np.uint8) * 255)
+	mask_resized = cv2.resize(mask_u8, (w, h), interpolation=cv2.INTER_NEAREST)
+	keep = mask_resized > 0
+	if not keep.any():
+		return img_rgb.copy()
+
+	output = img_rgb.copy()
+	overlay = np.zeros_like(output)
+	overlay[:, :] = np.array(color, dtype=np.uint8)
+	output[keep] = (alpha * overlay[keep] + (1.0 - alpha) * output[keep]).astype(np.uint8)
+	return output
+
+
+def _save_all_masks(
+	img_rgb: np.ndarray,
+	mask_tensor: torch.Tensor,
+	score_tensor: Optional[torch.Tensor],
+	output_dir: Path,
+	image_path: Path,
+	test_dir: Path,
+) -> None:
+	shape = list(mask_tensor.shape)
+	if len(shape) == 4:
+		masks = mask_tensor[0]
+	elif len(shape) == 3:
+		masks = mask_tensor
+	else:
+		return
+
+	num_masks = int(masks.shape[0])
+	if num_masks <= 0:
+		return
+
+	scores = None
+	if score_tensor is not None:
+		scores_flat = score_tensor.detach().cpu().numpy().reshape(-1)
+		if scores_flat.size >= num_masks:
+			scores = scores_flat[:num_masks]
+
+	colors = [
+		(255, 99, 71),
+		(60, 179, 113),
+		(30, 144, 255),
+		(238, 130, 238),
+		(255, 215, 0),
+		(0, 206, 209),
+		(255, 105, 180),
+		(123, 104, 238),
+		(154, 205, 50),
+		(255, 140, 0),
+	]
+
+	for i in range(num_masks):
+		mask_i = masks[i].unsqueeze(0)
+		color = colors[i % len(colors)]
+		overlayed = _overlay_mask_on_image(img_rgb, mask_i, color=color, alpha=0.45)
+		score = float(scores[i]) if scores is not None else None
+		score_tag = f"score{score:.3f}" if score is not None else "scoreNA"
+		suffix = f"m{str(i).zfill(2)}_{score_tag}"
+		out_path = _build_mask_variant_path(image_path, test_dir, output_dir, suffix)
+		out_path.parent.mkdir(parents=True, exist_ok=True)
+		out_bgr = cv2.cvtColor(overlayed, cv2.COLOR_RGB2BGR)
+		ok = cv2.imwrite(str(out_path), out_bgr)
+		if not ok:
+			raise RuntimeError(f"Failed to save mask image: {out_path}")
+
+
+def _scale_bbox_to_mask(
+	bbox_xyxy: np.ndarray,
+	src_size: int,
+	mask_w: int,
+	mask_h: int,
+) -> np.ndarray:
+	scale_x = float(mask_w) / max(src_size, 1)
+	scale_y = float(mask_h) / max(src_size, 1)
+	x1, y1, x2, y2 = bbox_xyxy.tolist()
+	x1 = min(max(x1 * scale_x, 0.0), float(mask_w))
+	y1 = min(max(y1 * scale_y, 0.0), float(mask_h))
+	x2 = min(max(x2 * scale_x, 0.0), float(mask_w))
+	y2 = min(max(y2 * scale_y, 0.0), float(mask_h))
+	return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def _select_best_mask_tensor(
+	mask_tensor: torch.Tensor,
+	score_tensor: Optional[torch.Tensor],
+	bbox_xyxy: np.ndarray,
+	sam_input_size: int,
+) -> torch.Tensor:
+	shape = list(mask_tensor.shape)
+	if len(shape) <= 2:
+		return mask_tensor
+
+	if len(shape) == 4:
+		masks = mask_tensor[0]
+	elif len(shape) == 3:
+		masks = mask_tensor
+	else:
+		return mask_tensor
+
+	num_masks = int(masks.shape[0])
+	if num_masks <= 1:
+		return mask_tensor
+
+	scores = None
+	if score_tensor is not None:
+		scores_flat = score_tensor.detach().cpu().numpy().reshape(-1)
+		if scores_flat.size >= num_masks:
+			scores = scores_flat[:num_masks]
+
+	data = masks.detach().cpu().numpy()
+	mask_h = int(data.shape[1])
+	mask_w = int(data.shape[2])
+	bbox = _scale_bbox_to_mask(bbox_xyxy, sam_input_size, mask_w, mask_h)
+	x1 = int(max(0, min(mask_w, bbox[0])))
+	y1 = int(max(0, min(mask_h, bbox[1])))
+	x2 = int(max(0, min(mask_w, bbox[2])))
+	y2 = int(max(0, min(mask_h, bbox[3])))
+
+	best_idx = 0
+	best_score = float("-inf")
+	best_has_inside = False
+
+	for i in range(num_masks):
+		mask_i = data[i] > 0.0
+		inside = int(mask_i[y1:y2, x1:x2].sum()) if (x2 > x1 and y2 > y1) else 0
+		has_inside = inside > 0
+		raw_score = float(scores[i]) if scores is not None else 1.0
+
+		is_better = False
+		if has_inside and not best_has_inside:
+			is_better = True
+		elif has_inside == best_has_inside and raw_score > best_score:
+			is_better = True
+
+		if is_better:
+			best_idx = i
+			best_score = raw_score
+			best_has_inside = has_inside
+
+	selected = torch.from_numpy(data[best_idx]).unsqueeze(0)
+	return selected
+
+
 def apply_sam_mask(
 	img_rgb: np.ndarray,
 	bbox_xyxy: np.ndarray,
 	sam_encoder: ExecuTorchModule,
 	sam_decoder: ExecuTorchModule,
 	sam_input_size: int,
+	save_all_masks_dir: Optional[Path] = None,
+	image_path: Optional[Path] = None,
+	test_dir: Optional[Path] = None,
 ) -> np.ndarray:
 	sam_tensor = _to_sam_tensor(img_rgb, sam_input_size)
 	encoder_outputs = sam_encoder.forward(sam_tensor)
@@ -316,8 +490,19 @@ def apply_sam_mask(
 	image_embed, feat_s0, feat_s1 = _select_sam_features(encoder_tensors, sam_input_size)
 	scaled_bbox = _scale_bbox(bbox_xyxy, img_rgb.shape[1], img_rgb.shape[0], sam_input_size, sam_input_size)
 	box_tensor = torch.from_numpy(scaled_bbox).view(1, 1, 4)
-	decoder_outputs = sam_decoder.forward(image_embed, feat_s0, feat_s1, box_tensor)
-	mask_tensor = _normalize_outputs(decoder_outputs)[0]
+	decoder_outputs = sam_decoder.forward(
+		image_embed,
+		feat_s0,
+		feat_s1,
+		box_tensor,
+	)
+	decoder_tensors = _normalize_outputs(decoder_outputs)
+	print(f"decoder output tensors shape: {decoder_tensors[0].shape}, scores shape: {decoder_tensors[1].shape if len(decoder_tensors) > 1 else 'N/A'}")
+	mask_tensor = decoder_tensors[0]
+	score_tensor = decoder_tensors[1] if len(decoder_tensors) > 1 else None
+	if save_all_masks_dir is not None and image_path is not None and test_dir is not None:
+		_save_all_masks(img_rgb, mask_tensor, score_tensor, save_all_masks_dir, image_path, test_dir)
+	mask_tensor = _select_best_mask_tensor(mask_tensor, score_tensor, scaled_bbox, sam_input_size)
 	return _apply_mask_to_image(img_rgb, mask_tensor)
 
 
@@ -427,6 +612,12 @@ def main() -> None:
 		help="Directory to save SAM-masked images (mirrors test_dir structure)",
 	)
 	parser.add_argument(
+		"--save_all_masks_dir",
+		type=str,
+		default=None,
+		help="Directory to save all SAM mask variants (mirrors test_dir structure)",
+	)
+	parser.add_argument(
 		"--save_bbox_dir",
 		type=str,
 		default=None,
@@ -446,7 +637,8 @@ def main() -> None:
 	)
 	parser.add_argument("--no_sam", action="store_true", help="Disable SAM masking (default uses full-image box)")
 	parser.add_argument("--image_size", type=int, default=224, help="Second-stage input size")
-	parser.add_argument("--sam_input_size", type=int, default=512, help="SAM input size")
+	parser.add_argument("--sam_input_size", type=int, default=256, help="SAM input size")
+	# parser.add_argument("--sam_input_size", type=int, default=512, help="SAM input size")  # (orig 512)
 	parser.add_argument("--batch_size", type=int, default=32, help="Batch size for --no_sam")
 	parser.add_argument("--device", type=str, default="cpu", help="Device for --no_sam (e.g., cpu, cuda)")
 	parser.add_argument("--debug_preprocess", action="store_true", help="Print preprocess tensor stats")
@@ -492,6 +684,7 @@ def main() -> None:
 	y_pred: List[int] = []
 	infer_times_ms: List[float] = []
 	save_masked_dir = Path(args.save_masked_dir) if args.save_masked_dir else None
+	save_all_masks_dir = Path(args.save_all_masks_dir) if args.save_all_masks_dir else None
 	save_bbox_dir = Path(args.save_bbox_dir) if args.save_bbox_dir else None
 
 	if use_sam:
@@ -518,7 +711,16 @@ def main() -> None:
 					ok = cv2.imwrite(str(bbox_out_path), bbox_bgr)
 					if not ok:
 						raise RuntimeError(f"Failed to save bbox image: {bbox_out_path}")
-				work_rgb = apply_sam_mask(work_rgb, bbox_xyxy, sam_encoder, sam_decoder, args.sam_input_size)
+				work_rgb = apply_sam_mask(
+					work_rgb,
+					bbox_xyxy,
+					sam_encoder,
+					sam_decoder,
+					args.sam_input_size,
+					save_all_masks_dir=save_all_masks_dir,
+					image_path=image_path,
+					test_dir=Path(args.test_dir),
+				)
 				if save_masked_dir is not None:
 					out_path = _build_masked_output_path(image_path, Path(args.test_dir), save_masked_dir)
 					out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -532,7 +734,8 @@ def main() -> None:
 			embedding = embedding_map[crop_name]
 			if embedding.shape != (num_queries, embed_dim):
 				embedding = embedding.reshape(num_queries, embed_dim)
-			text_tensor = torch.from_numpy(embedding).view(1, num_queries, embed_dim)
+			text_tensor = torch.from_numpy(np.ascontiguousarray(embedding)).view(1, num_queries, embed_dim).contiguous()
+			# Tester.py 메인 루프 내부, model 호출 직전에 추가
 
 			if debug_seen < args.debug_samples:
 				if args.debug_preprocess:
@@ -603,6 +806,7 @@ def main() -> None:
 
 			image_batch = torch.from_numpy(np.stack(batch_images, axis=0)).to(device)
 			text_batch = torch.from_numpy(np.stack(batch_texts, axis=0)).to(device)
+
 			if device.type == "cuda":
 				torch.cuda.synchronize()
 			t_start = time.perf_counter()
@@ -611,11 +815,14 @@ def main() -> None:
 					pth_logits = pth_model(image_batch.cpu(), text_batch.cpu()).detach().cpu().numpy()
 				logits = pth_logits
 			else:
-				outputs = second_stage.forward(image_batch, text_batch)
+				outputs = second_stage.forward(image_batch.contiguous(), text_batch.contiguous())
 			if device.type == "cuda":
 				torch.cuda.synchronize()
 			t_end = time.perf_counter()
 			if not args.pth_only:
+				#print("=== ExecuTorch Inputs State ===")
+				#print(f"Image: shape={image_batch.shape}, dtype={image_batch.dtype}, device={image_batch.device}, contiguous={image_batch.is_contiguous()}")
+				#print(f"Text : shape={text_batch.shape}, dtype={text_batch.dtype}, device={text_batch.device}, contiguous={text_batch.is_contiguous()}")
 				logits_tensor = _normalize_outputs(outputs)[0]
 				logits = logits_tensor.detach().cpu().numpy()
 			pred_indices = np.argmax(logits, axis=1) if logits.size else np.zeros(len(batch_labels), dtype=np.int64)

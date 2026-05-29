@@ -16,6 +16,89 @@ DEFAULT_SAM_WEIGHTS = PROJECT_ROOT / "weights" / "sam2.1_t.pt"
 DEFAULT_TEXT_EMBEDDING_DIR = PROJECT_ROOT / "data" / "TextEmbeddings"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "mobile_assets"
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ExportableCrossAttention(nn.Module):
+    """
+    nn.MultiheadAttention(batch_first=True) 와 수치적으로 동등하지만
+    torch.export + XNNPACK 에 안전한 manual 구현.
+    학습된 nn.MultiheadAttention 가중치를 그대로 로드 가능.
+    """
+    def __init__(self, embed_dim: int, num_heads: int, residual_scale: float = 1.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.residual_scale = residual_scale
+
+        # nn.MultiheadAttention 의 in_proj_weight (3*E, E), in_proj_bias (3*E,) 와 호환
+        self.in_proj_weight = nn.Parameter(torch.empty(3 * embed_dim, embed_dim))
+        self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim))
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, image_features: torch.Tensor, text_queries: torch.Tensor) -> torch.Tensor:
+        # image_features: (B, N, E), text_queries: (B, M, E)
+        B, N, E = image_features.shape
+        M = text_queries.shape[1]
+        H, D = self.num_heads, self.head_dim
+
+        # Q from image, K/V from text  — nn.MultiheadAttention 와 동일한 분할
+        Wq, Wk, Wv = self.in_proj_weight.chunk(3, dim=0)   # (E,E) x 3
+        bq, bk, bv = self.in_proj_bias.chunk(3, dim=0)     # (E,)  x 3
+
+        q = F.linear(image_features, Wq, bq)   # (B, N, E)
+        k = F.linear(text_queries,  Wk, bk)    # (B, M, E)
+        v = F.linear(text_queries,  Wv, bv)    # (B, M, E)
+
+        # (B, H, N, D)
+        q = q.reshape(B, N, H, D).transpose(1, 2)
+        k = k.reshape(B, M, H, D).transpose(1, 2)
+        v = v.reshape(B, M, H, D).transpose(1, 2)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale   # (B, H, N, M)
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)                                # (B, H, N, D)
+        out = out.transpose(1, 2).reshape(B, N, E)                 # (B, N, E)
+        out = self.out_proj(out)                                   # (B, N, E)
+
+        return self.norm(image_features + self.residual_scale * out)
+
+
+def convert_mha_to_exportable(model: nn.Module) -> nn.Module:
+    """
+    SecondStageClassifier 내부의 CrossAttentionModule 을
+    ExportableCrossAttention 으로 in-place 교체하면서 가중치를 그대로 옮긴다.
+    """
+    ca = model.cross_attention            # 기존 CrossAttentionModule
+    mha = ca.multihead_attn               # nn.MultiheadAttention
+    embed_dim = mha.embed_dim
+    num_heads = mha.num_heads
+
+    new_ca = ExportableCrossAttention(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        residual_scale=getattr(ca, "residual_scale", 1.0),
+    )
+
+    with torch.no_grad():
+        # nn.MultiheadAttention의 가중치 명명을 그대로 매핑
+        new_ca.in_proj_weight.copy_(mha.in_proj_weight)
+        new_ca.in_proj_bias.copy_(mha.in_proj_bias)
+        new_ca.out_proj.weight.copy_(mha.out_proj.weight)
+        new_ca.out_proj.bias.copy_(mha.out_proj.bias)
+        new_ca.norm.weight.copy_(ca.norm.weight)
+        new_ca.norm.bias.copy_(ca.norm.bias)
+
+    model.cross_attention = new_ca
+    return model
+
+
 
 def export_second_stage_checkpoint(checkpoint_path: Path, output_dir: Path) -> Tuple[Path, Path, Path]:
 	from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
@@ -34,17 +117,25 @@ def export_second_stage_checkpoint(checkpoint_path: Path, output_dir: Path) -> T
 
 	model = build_model_from_checkpoint(checkpoint, num_classes=len(class_names), device=torch.device("cpu"))
 	model.eval()
+	"""
+	model = convert_mha_to_exportable(model)   # ← 추가
 
+	# 그 다음 PyTorch ↔ Export 일치 확인 (강력 권장)
+	with torch.no_grad():
+		img = torch.randn(1, 3, image_size, image_size)
+		txt = torch.randn(1, 5, embed_dim)
+		ref_logits = model(img, txt)
+	"""
 	sample_inputs = (
 		torch.randn(1, 3, image_size, image_size),
 		torch.randn(1, 5, embed_dim),
 	)
-
+	#sample_inputs = (img, txt)
 	et_program = to_edge_transform_and_lower(
 		torch.export.export(model, sample_inputs),
 		partitioner=[XnnpackPartitioner()],
 	).to_executorch()
-
+	
 	output_dir.mkdir(parents=True, exist_ok=True)
 	pte_path = output_dir / "second_stage.pte"
 	with pte_path.open("wb") as f:
@@ -55,7 +146,23 @@ def export_second_stage_checkpoint(checkpoint_path: Path, output_dir: Path) -> T
 
 	config_path = output_dir / "second_stage_config.json"
 	config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+	# export_mobile_assets.py 의 export_second_stage_checkpoint 끝부분에 추가
+	from executorch.runtime import Runtime
 
+	# (1) PyTorch 원본 출력
+	with torch.no_grad():
+		pt_out = model(sample_inputs[0], sample_inputs[1])
+
+	# (2) ExecuTorch 출력 (방금 export한 buffer 재로드)
+	runtime = Runtime.get()
+	program = runtime.load_program(et_program.buffer)
+	method = program.load_method("forward")
+	et_out = method.execute([sample_inputs[0], sample_inputs[1]])[0]
+
+	diff = (pt_out - et_out).abs()
+	print(f"max diff: {diff.max().item():.6e}")
+	print(f"mean diff: {diff.mean().item():.6e}")
+	print(f"argmax match: {(pt_out.argmax(-1) == et_out.argmax(-1)).all().item()}")
 	return pte_path, class_names_path, config_path
 
 

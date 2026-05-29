@@ -8,7 +8,7 @@ from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPar
 
 def main():
     pt_path = "weights/sam2.1_t.pt"
-    pte_encoder_path = "mobile_assets/sam2.1_t_encoder1024.pte"
+    pte_encoder_path = "mobile_assets/sam2.1_t_encoder256.pte"
     
     print("[Step 1] SAM 2.1 모델 로드 및 Image Encoder 분리...")
     sam_wrapper = SAM(pt_path)
@@ -16,7 +16,7 @@ def main():
     image_encoder = raw_model.image_encoder
     
     # [핵심 수정] 모바일 최적화를 위해 1024x1024 입력 텐서 주입
-    encoder_input = (torch.randn(1, 3, 1024, 1024),)
+    encoder_input = (torch.randn(1, 3, 256, 256),)
     
     print("[Step 2] 1024x1024 규격 Image Encoder EXIR 캡처 중 (torch.export)...")
     exported_program = export(image_encoder, encoder_input)
